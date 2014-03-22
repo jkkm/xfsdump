@@ -35,44 +35,6 @@
 
 #include <linux/posix_types.h>
 
-/* Copied from kernel-features.h for __ASSUME_GETDENTS64_SYSCALL */
-#ifndef __LINUX_KERNEL_VERSION
-/* We assume the worst; all kernels should be supported.  */
-# define __LINUX_KERNEL_VERSION 0
-#endif
-/* The getdents64 syscall was introduced in 2.4.0-test7.  We test for
-   2.4.1 for the earliest version we know the syscall is available.  */
-#if __LINUX_KERNEL_VERSION >= 132097
-# define __ASSUME_GETDENTS64_SYSCALL    1
-#endif
-/* There are an infinite number of PA-RISC kernel versions numbered
-   2.4.0.  But they've not really been released as such.  We require
-   and expect the final version here.  */
-#ifdef __hppa__
-# define __ASSUME_GETDENTS64_SYSCALL    1
-#endif
-
-#ifndef __set_errno
-#define __set_errno(e) (errno = (e))
-#endif
-
-
-#ifdef __NR_getdents64
-# ifndef __ASSUME_GETDENTS64_SYSCALL
-#  ifndef __GETDENTS
-/* The variable is shared between all *getdents* calls.  */
-int __have_no_getdents64;
-#  else
-extern int __have_no_getdents64;
-#  endif
-# endif
-/* Earlier versions of glibc don't define SYS_getdents64 at all */
-# ifndef SYS_getdents64
-#  define SYS_getdents64 __NR_getdents64
-# endif
-#endif
-
-
 /* For Linux we need a special version of this file since the
    definition of `struct dirent' is not the same for the kernel and
    the libc.  There is one additional field which might be introduced
@@ -97,11 +59,22 @@ struct kernel_dirent64
     char		d_name[256];
   };
 
-#ifndef DIRENT_TYPE
-# define DIRENT_TYPE struct dirent
+#define DIRENT_SET_DP_INO(dp, value) (dp)->d_ino = (value)
+
+#define __set_errno(e) (errno = (e))
+
+int __have_no_getdents64;
+
+#ifdef __NR_getdents64
+# define __SYS_GETDENTS64(fd, buf, len) (syscall(SYS_getdents64, fd, buf, len))
+#else
+# define __SYS_GETDENTS64(fd, buf, len) ({ __set_errno(ENOSYS); -1; })
 #endif
-#ifndef DIRENT_SET_DP_INO
-# define DIRENT_SET_DP_INO(dp, value) (dp)->d_ino = (value)
+
+#ifdef __NR_getdents
+# define __SYS_GETDENTS(fd, buf, len) (syscall(SYS_getdents, fd, buf, len))
+#else
+# define __SYS_GETDENTS(fd, buf, len) ({ __set_errno(ENOSYS); -1; })
 #endif
 
 /* The problem here is that we cannot simply read the next NBYTES
@@ -115,50 +88,43 @@ struct kernel_dirent64
 int
 getdents_wrap (int fd, char *buf, size_t nbytes)
 {
-  DIRENT_TYPE *dp;
+  struct dirent *dp;
   off64_t last_offset = -1;
   ssize_t retval;
 
-#ifdef __NR_getdents64
-# ifndef __ASSUME_GETDENTS64_SYSCALL
   if (!__have_no_getdents64)
-# endif
     {
-# ifndef __ASSUME_GETDENTS64_SYSCALL
       int saved_errno = errno;
-# endif
       char *kbuf = buf;
       size_t kbytes = nbytes;
-      if (offsetof (DIRENT_TYPE, d_name)
+      if (offsetof (struct dirent, d_name)
 	  < offsetof (struct kernel_dirent64, d_name)
-	  && nbytes <= sizeof (DIRENT_TYPE))
+	  && nbytes <= sizeof (struct dirent))
 	{
 	  kbytes = nbytes + offsetof (struct kernel_dirent64, d_name)
-		   - offsetof (DIRENT_TYPE, d_name);
+		   - offsetof (struct dirent, d_name);
 	  kbuf = alloca(kbytes);
 	}
-      retval = syscall(SYS_getdents64, fd, kbuf, kbytes);
-# ifndef __ASSUME_GETDENTS64_SYSCALL
-      if (retval != -1 && errno != -EINVAL)
-# endif
+      retval = __SYS_GETDENTS64(fd, kbuf, kbytes);
+      if (retval != -1)
 	{
 	  struct kernel_dirent64 *kdp;
 	  const size_t size_diff = (offsetof (struct kernel_dirent64, d_name)
-				    - offsetof (DIRENT_TYPE, d_name));
+				    - offsetof (struct dirent, d_name));
 
 	  /* If the structure returned by the kernel is identical to what we
 	     need, don't do any conversions.  */
-	  if (offsetof (DIRENT_TYPE, d_name)
+	  if (offsetof (struct dirent, d_name)
 	      == offsetof (struct kernel_dirent64, d_name)
 	      && sizeof (dp->d_ino) == sizeof (kdp->d_ino)
 	      && sizeof (dp->d_off) == sizeof (kdp->d_off))
 	    return retval;
 
-	  dp = (DIRENT_TYPE *)buf;
+	  dp = (struct dirent *)buf;
 	  kdp = (struct kernel_dirent64 *) kbuf;
 	  while ((char *) kdp < kbuf + retval)
 	    {
-	      const size_t alignment = __alignof__ (DIRENT_TYPE);
+	      const size_t alignment = __alignof__ (struct dirent);
 	      /* Since kdp->d_reclen is already aligned for the kernel
 		 structure this may compute a value that is bigger
 		 than necessary.  */
@@ -194,41 +160,39 @@ getdents_wrap (int fd, char *buf, size_t nbytes)
 	      memmove (dp->d_name, kdp->d_name,
 		       old_reclen - offsetof (struct kernel_dirent64, d_name));
 
-	      dp = (DIRENT_TYPE *) ((char *) dp + new_reclen);
+	      dp = (struct dirent *) ((char *) dp + new_reclen);
 	      kdp = (struct kernel_dirent64 *) ((char *) kdp + old_reclen);
 	    }
 
 	  return (char *) dp - buf;
 	}
 
-# ifndef __ASSUME_GETDENTS64_SYSCALL
       __set_errno (saved_errno);
       __have_no_getdents64 = 1;
-# endif
     }
-#endif
+
+  /* fallback to getdents */
   {
     size_t red_nbytes;
     struct kernel_dirent *skdp, *kdp;
-    const size_t size_diff = (offsetof (DIRENT_TYPE, d_name)
+    const size_t size_diff = (offsetof (struct dirent, d_name)
 			      - offsetof (struct kernel_dirent, d_name));
 
     red_nbytes = MIN (nbytes
-		      - ((nbytes / (offsetof (DIRENT_TYPE, d_name) + 14))
+		      - ((nbytes / (offsetof (struct dirent, d_name) + 14))
 			 * size_diff),
 		      nbytes - size_diff);
 
-    dp = (DIRENT_TYPE *) buf;
+    dp = (struct dirent *) buf;
     skdp = kdp = alloca (red_nbytes);
 
-    retval = syscall(SYS_getdents, fd, kdp, red_nbytes);
-
+    retval = __SYS_GETDENTS(fd, kdp, red_nbytes);
     if (retval == -1)
       return -1;
 
     while ((char *) kdp < (char *) skdp + retval)
       {
-	const size_t alignment = __alignof__ (DIRENT_TYPE);
+	const size_t alignment = __alignof__ (struct dirent);
 	/* Since kdp->d_reclen is already aligned for the kernel structure
 	   this may compute a value that is bigger than necessary.  */
 	size_t new_reclen = ((kdp->d_reclen + size_diff + alignment - 1)
@@ -259,7 +223,7 @@ getdents_wrap (int fd, char *buf, size_t nbytes)
 	memcpy (dp->d_name, kdp->d_name,
 		kdp->d_reclen - offsetof (struct kernel_dirent, d_name));
 
-	dp = (DIRENT_TYPE *) ((char *) dp + new_reclen);
+	dp = (struct dirent *) ((char *) dp + new_reclen);
 	kdp = (struct kernel_dirent *) (((char *) kdp) + kdp->d_reclen);
       }
     }
